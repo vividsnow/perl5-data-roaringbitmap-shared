@@ -19,6 +19,8 @@
  * explicit DESTROY, so the local `h` would dangle.  Used only where magic
  * can actually intervene between EXTRACT and the first use of h. */
 #define REEXTRACT(sv) \
+    if (!SvROK(sv)) \
+        croak("Data::RoaringBitmap::Shared object was replaced during the call"); \
     h = INT2PTR(RbHandle*, SvIV(SvRV(sv))); \
     if (!h) croak("Data::RoaringBitmap::Shared object destroyed during the call")
 
@@ -349,6 +351,10 @@ union(self, other)
     {
         RbHandle *o = INT2PTR(RbHandle*, SvIV(SvRV(other)));
         if (!o) croak("Attempted to use a destroyed Data::RoaringBitmap::Shared object");
+        /* sv_isobject/sv_derived_from above begin with SvGETMAGIC(other), so a
+         * tied `other` can have destroyed self before h is used below. `o` was
+         * read after that magic and needs no re-read. */
+        REEXTRACT(self);
         /* Same underlying bitmap (same handle, or two handles to one mapping
          * sharing a bitmap_id) -> a |= a is a no-op.  Must short-circuit before
          * locking: taking the write lock and the read lock on the SAME rwlock
@@ -389,6 +395,10 @@ intersect(self, other)
     {
         RbHandle *o = INT2PTR(RbHandle*, SvIV(SvRV(other)));
         if (!o) croak("Attempted to use a destroyed Data::RoaringBitmap::Shared object");
+        /* sv_isobject/sv_derived_from above begin with SvGETMAGIC(other), so a
+         * tied `other` can have destroyed self before h is used below. `o` was
+         * read after that magic and needs no re-read. */
+        REEXTRACT(self);
         /* Same underlying bitmap (same handle, or two handles to one mapping
          * sharing a bitmap_id) -> a &= a is a no-op.  Short-circuit before
          * locking to avoid self-deadlocking on the one shared rwlock. */
