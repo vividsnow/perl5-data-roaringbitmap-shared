@@ -10,6 +10,7 @@
         croak("Expected a Data::RoaringBitmap::Shared object"); \
     RbHandle *h = INT2PTR(RbHandle*, SvIV(SvRV(sv))); \
     if (!h) croak("Attempted to use a destroyed Data::RoaringBitmap::Shared object"); \
+    RbHandle *h0 = h; PERL_UNUSED_VAR(h0); \
     sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
 /* Re-read the handle after a call that can run Perl code (tied/overloaded
@@ -22,7 +23,7 @@
     if (!SvROK(sv)) \
         croak("Data::RoaringBitmap::Shared object was replaced during the call"); \
     h = INT2PTR(RbHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Data::RoaringBitmap::Shared object destroyed during the call")
+    if (h != h0) croak("Data::RoaringBitmap::Shared object replaced or destroyed during the call")
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
@@ -159,6 +160,7 @@ add_many(self, ints)
     if (!SvROK(ints) || SvTYPE(SvRV(ints)) != SVt_PVAV)
         croak("Data::RoaringBitmap::Shared->add_many: expected an array reference");
     av = (AV *)SvRV(ints);
+    sv_2mortal(SvREFCNT_inc((SV *)av));   /* pin the arrayref: element magic below cannot free it mid-loop */
     n = av_len(av) + 1;
     /* Resolve + range-check every value BEFORE the lock (croak-free section). */
     Newx(vals, n > 0 ? n : 1, UV);
