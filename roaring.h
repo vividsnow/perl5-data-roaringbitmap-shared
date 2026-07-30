@@ -129,7 +129,8 @@ struct RbHeader {
     uint32_t drain_seq;               /* 80  futex bumped by a reader releasing under a draining writer (wakes it) */
     uint32_t slotless_rdepth;         /* 84  readers holding with no reader-slot (documented residual); also aligns stat_ops */
     uint64_t stat_ops;                /* 88 */
-    uint8_t  _pad1[160];              /* 96..255 */
+    uint8_t  sealed;                  /* 96  0 = mutable, 1 = frozen (read-only; lock-free reads) */
+    uint8_t  _pad1[159];              /* 97..255 */
 };
 typedef struct RbHeader RbHeader;
 
@@ -152,6 +153,7 @@ typedef struct RbHandle {
     uint32_t      cached_pid;     /* getpid() cached at last slot claim */
     uint32_t      cached_fork_gen;/* rb_fork_gen value at last slot claim */
     uint32_t      slotless_held;  /* read-locks this process holds with no reader-slot */
+    int           readonly;       /* 1 = frozen O_RDONLY/PROT_READ view: lock-free reads, mutation croaks */
 } RbHandle;
 
 /* ================================================================
@@ -1200,6 +1202,10 @@ static RbHandle *rb_create(const char *path, uint64_t container_cap_in, mode_t f
             if (!rb_validate_header((RbHeader *)base, (uint64_t)st.st_size)) {
                 RB_ERR("invalid roaring-bitmap file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
+            if (((RbHeader *)base)->sealed) {
+                RB_ERR("%s is frozen (read-only); open it with new_readonly", path);
+                munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
+            }
             flock(fd, LOCK_UN); close(fd);
             return rb_setup(base, map_size, path, -1);
         }
@@ -1237,6 +1243,10 @@ static RbHandle *rb_open_fd(int fd, char *errbuf) {
     if (!rb_validate_header((RbHeader *)base, (uint64_t)st.st_size)) {
         RB_ERR("invalid roaring-bitmap file"); munmap(base, ms); return NULL;
     }
+    if (((RbHeader *)base)->sealed) {
+        RB_ERR("this roaring bitmap is frozen (read-only); open it with new_readonly");
+        munmap(base, ms); return NULL;
+    }
     int myfd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (myfd < 0) { RB_ERR("fcntl: %s", strerror(errno)); munmap(base, ms); return NULL; }
     return rb_setup(base, ms, NULL, myfd);
@@ -1267,6 +1277,52 @@ static void rb_destroy(RbHandle *h) {
 static inline int rb_msync(RbHandle *h) {
     if (!h || !h->base) return 0;
     return msync(h->base, h->mmap_size, MS_SYNC);
+}
+
+/* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, no lock ever.
+ * The bucket table + container pool + geometry are immutable in a sealed file,
+ * so contains / cardinality / min / max / to_array read directly with no
+ * reader-slot / rwlock traffic -- the mapping is never written, so it works from
+ * a read-only fd / read-only filesystem and can be shared PROT_READ across
+ * processes (same architecture; the native magic rejects a wrong-endian file at
+ * validation).  None of the read paths lazily normalize a container or write a
+ * cached cardinality back into the mapping (every array<->bitmap conversion and
+ * the cardinality recompute happen only in mutators), so a lock-free read of a
+ * PROT_READ mapping never faults. */
+static RbHandle *rb_open_readonly(const char *path, char *errbuf) {
+    if (errbuf) errbuf[0] = '\0';
+    int fd = open(path, O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    if (fd < 0) { RB_ERR("open %s: %s", path, strerror(errno)); return NULL; }
+    struct stat st;
+    if (fstat(fd, &st) < 0) { RB_ERR("fstat %s: %s", path, strerror(errno)); close(fd); return NULL; }
+    if ((uint64_t)st.st_size < sizeof(RbHeader)) { RB_ERR("%s: file too small", path); close(fd); return NULL; }
+    size_t ms = (size_t)st.st_size;
+    void *base = mmap(NULL, ms, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);   /* the mapping keeps the file; a read-only view needs no fd (no msync/ftruncate) */
+    if (base == MAP_FAILED) { RB_ERR("mmap %s: %s", path, strerror(errno)); return NULL; }
+    if (!rb_validate_header((RbHeader *)base, (uint64_t)st.st_size)) {
+        RB_ERR("%s: invalid roaring-bitmap file", path); munmap(base, ms); return NULL;
+    }
+    if (!((RbHeader *)base)->sealed) {
+        RB_ERR("%s is not frozen: call ->freeze on the producer before opening read-only", path);
+        munmap(base, ms); return NULL;
+    }
+    RbHandle *h = rb_setup(base, ms, path, -1);   /* munmaps on OOM */
+    if (!h) { RB_ERR("out of memory"); return NULL; }
+    h->readonly = 1;
+    return h;
+}
+
+/* Seal a bitmap: make it permanently immutable so it can be shipped and opened
+ * read-only.  Takes the write lock so no mutation is in flight, publishes the
+ * seal, then flushes it (file/memfd-backed).  Afterwards every mutator croaks
+ * and a read-write reopen is refused. */
+static int rb_freeze(RbHandle *h) {
+    rb_rwlock_wrlock(h);
+    h->hdr->sealed = 1;
+    rb_rwlock_wrunlock(h);
+    if (h->path || h->backing_fd >= 0) return rb_msync(h);  /* durability for file/memfd-backed */
+    return 0;   /* anonymous: the seal lives in shared memory (visible to forks); nothing to flush */
 }
 
 #endif /* ROARING_H */

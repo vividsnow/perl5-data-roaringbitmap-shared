@@ -108,6 +108,24 @@ new_from_fd(class, fd)
   OUTPUT:
     RETVAL
 
+SV *
+new_readonly(class, path)
+    const char *class
+    SV *path
+  PREINIT:
+    char errbuf[RB_ERR_BUFLEN];
+  CODE:
+    /* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, lock-free.
+       Requires ->freeze on the producer; a non-frozen file is refused. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    if (!p) croak("Data::RoaringBitmap::Shared->new_readonly: path is required");
+    RbHandle *h = rb_open_readonly(p, errbuf);
+    if (!h) croak("Data::RoaringBitmap::Shared->new_readonly: %s", errbuf);
+    class = SvPV_nolen(ST(0));   /* re-read: path get-magic may have realloced ST(0)'s PV before bless */
+    MAKE_OBJ(class, h);
+  OUTPUT:
+    RETVAL
+
 void
 DESTROY(self)
     SV *self
@@ -126,11 +144,13 @@ add(self, x)
     int added;
     uint32_t hi;
   CODE:
+    if (h->readonly) croak("Data::RoaringBitmap::Shared->add: bitmap is frozen (read-only)");
     /* Range-check BEFORE locking: a croak must never happen under the lock. */
     if (x > RB_UINT32_MAX_UV)
         croak("Data::RoaringBitmap::Shared->add: value %" UVuf " exceeds uint32 (max 4294967295)", x);
     hi = (uint32_t)(x >> 16);
     rb_rwlock_wrlock(h);
+    if (h->hdr->sealed) { rb_rwlock_wrunlock(h); croak("Data::RoaringBitmap::Shared->add: bitmap is frozen (read-only)"); }
     /* Need a free container slot only if this value touches an empty bucket. */
     if (rb_buckets(h)[hi].type == RB_TYPE_NONE && rb_avail_slots(h) == 0) {
         __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);   /* a call that took the write lock counts (matches add_many) */
@@ -156,6 +176,7 @@ add_many(self, ints)
     UV *vals;
     IV total_added;
   CODE:
+    if (h->readonly) croak("Data::RoaringBitmap::Shared->add_many: bitmap is frozen (read-only)");
     SvGETMAGIC(ints);
     if (!SvROK(ints) || SvTYPE(SvRV(ints)) != SVt_PVAV)
         croak("Data::RoaringBitmap::Shared->add_many: expected an array reference");
@@ -178,6 +199,7 @@ add_many(self, ints)
     total_added = 0;
     REEXTRACT(self);
     rb_rwlock_wrlock(h);
+    if (h->hdr->sealed) { rb_rwlock_wrunlock(h); croak("Data::RoaringBitmap::Shared->add_many: bitmap is frozen (read-only)"); }
     for (i = 0; i < n; i++) {
         uint32_t hi = (uint32_t)(vals[i] >> 16);
         if (rb_buckets(h)[hi].type == RB_TYPE_NONE && rb_avail_slots(h) == 0) {
@@ -202,6 +224,9 @@ contains(self, x)
     EXTRACT(self);
   CODE:
     if (x > RB_UINT32_MAX_UV) { RETVAL = 0; }   /* a value out of range is simply absent */
+    else if (h->readonly) {                     /* frozen: immutable containers, no lock */
+        RETVAL = rb_contains_locked(h, (uint32_t)x) ? 1 : 0;
+    }
     else {
         rb_rwlock_rdlock(h);
         RETVAL = rb_contains_locked(h, (uint32_t)x) ? 1 : 0;
@@ -218,9 +243,11 @@ remove(self, x)
     EXTRACT(self);
     int removed;
   CODE:
+    if (h->readonly) croak("Data::RoaringBitmap::Shared->remove: bitmap is frozen (read-only)");
     if (x > RB_UINT32_MAX_UV) { RETVAL = 0; }   /* out of range -> nothing to remove */
     else {
         rb_rwlock_wrlock(h);
+        if (h->hdr->sealed) { rb_rwlock_wrunlock(h); croak("Data::RoaringBitmap::Shared->remove: bitmap is frozen (read-only)"); }
         removed = rb_remove_locked(h, (uint32_t)x);
         __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
         rb_rwlock_wrunlock(h);
@@ -235,9 +262,13 @@ cardinality(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    rb_rwlock_rdlock(h);
-    RETVAL = (UV)h->hdr->cardinality;
-    rb_rwlock_rdunlock(h);
+    if (h->readonly) {                          /* frozen: immutable, no lock */
+        RETVAL = (UV)h->hdr->cardinality;
+    } else {
+        rb_rwlock_rdlock(h);
+        RETVAL = (UV)h->hdr->cardinality;
+        rb_rwlock_rdunlock(h);
+    }
   OUTPUT:
     RETVAL
 
@@ -247,9 +278,13 @@ is_empty(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    rb_rwlock_rdlock(h);
-    RETVAL = (h->hdr->cardinality == 0) ? 1 : 0;
-    rb_rwlock_rdunlock(h);
+    if (h->readonly) {                          /* frozen: immutable, no lock */
+        RETVAL = (h->hdr->cardinality == 0) ? 1 : 0;
+    } else {
+        rb_rwlock_rdlock(h);
+        RETVAL = (h->hdr->cardinality == 0) ? 1 : 0;
+        rb_rwlock_rdunlock(h);
+    }
   OUTPUT:
     RETVAL
 
@@ -261,9 +296,13 @@ min(self)
     uint32_t v;
     int found;
   CODE:
-    rb_rwlock_rdlock(h);
-    found = rb_min_locked(h, &v);
-    rb_rwlock_rdunlock(h);
+    if (h->readonly) {                          /* frozen: immutable, no lock */
+        found = rb_min_locked(h, &v);
+    } else {
+        rb_rwlock_rdlock(h);
+        found = rb_min_locked(h, &v);
+        rb_rwlock_rdunlock(h);
+    }
     RETVAL = found ? newSVuv((UV)v) : &PL_sv_undef;
   OUTPUT:
     RETVAL
@@ -276,9 +315,13 @@ max(self)
     uint32_t v;
     int found;
   CODE:
-    rb_rwlock_rdlock(h);
-    found = rb_max_locked(h, &v);
-    rb_rwlock_rdunlock(h);
+    if (h->readonly) {                          /* frozen: immutable, no lock */
+        found = rb_max_locked(h, &v);
+    } else {
+        rb_rwlock_rdlock(h);
+        found = rb_max_locked(h, &v);
+        rb_rwlock_rdunlock(h);
+    }
     RETVAL = found ? newSVuv((UV)v) : &PL_sv_undef;
   OUTPUT:
     RETVAL
@@ -298,16 +341,20 @@ to_array(self)
        while the lock is held.  The cardinality may grow between the read and the
        fill, but to_array is a best-effort snapshot; we cap the fill at the buffer
        length so we never write past it. */
-    rb_rwlock_rdlock(h);
-    card = (UV)h->hdr->cardinality;
-    rb_rwlock_rdunlock(h);
+    if (h->readonly) {                          /* frozen: immutable, no lock */
+        card = (UV)h->hdr->cardinality;
+    } else {
+        rb_rwlock_rdlock(h);
+        card = (UV)h->hdr->cardinality;
+        rb_rwlock_rdunlock(h);
+    }
 
     {
         uint32_t *buf = NULL;
         RbBucket *bt;
         UV idx = 0;
         if (card) { Newx(buf, card, uint32_t); SAVEFREEPV(buf); }
-        rb_rwlock_rdlock(h);
+        if (!h->readonly) rb_rwlock_rdlock(h);
         bt = rb_buckets(h);
         for (uint32_t hi = 0; hi < RB_NUM_BUCKETS && idx < card; hi++) {
             if (bt[hi].type == RB_TYPE_NONE) continue;
@@ -328,7 +375,7 @@ to_array(self)
                 }
             }
         }
-        rb_rwlock_rdunlock(h);
+        if (!h->readonly) rb_rwlock_rdunlock(h);
 
         av = newAV();
         if (idx) {
@@ -348,6 +395,7 @@ union(self, other)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::RoaringBitmap::Shared->union: bitmap is frozen (read-only)");
     if (!sv_isobject(other) || !sv_derived_from(other, "Data::RoaringBitmap::Shared"))
         croak("Data::RoaringBitmap::Shared->union: expected a Data::RoaringBitmap::Shared object");
     {
@@ -365,9 +413,30 @@ union(self, other)
             __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
             SvREFCNT_inc(self);
             RETVAL = self;
+        } else if (o->readonly) {
+            /* Frozen other: its containers are immutable (PROT_READ), so read them
+             * lock-free -- take ONLY the receiver's write lock (a read lock on o's
+             * PROT_READ mapping would SIGSEGV).  No lock ordering is needed with
+             * one lock, so no rb_lock_pair. */
+            uint32_t need;
+            rb_rwlock_wrlock(h);
+            if (h->hdr->sealed) { rb_rwlock_wrunlock(h); croak("Data::RoaringBitmap::Shared->union: bitmap is frozen (read-only)"); }
+            need = rb_union_new_slots_needed(h, o);
+            if (rb_avail_slots(h) < need) {
+                __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
+                rb_rwlock_wrunlock(h);      /* release BEFORE croak */
+                croak("Data::RoaringBitmap::Shared->union: container pool exhausted "
+                      "(needs %u more container(s); grow container_capacity)", need);
+            }
+            rb_union_locked(h, o);
+            __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
+            rb_rwlock_wrunlock(h);
+            SvREFCNT_inc(self);
+            RETVAL = self;
         } else {
             uint32_t need;
             rb_lock_pair(h, o);
+            if (h->hdr->sealed) { rb_unlock_pair(h, o); croak("Data::RoaringBitmap::Shared->union: bitmap is frozen (read-only)"); }
             need = rb_union_new_slots_needed(h, o);
             if (rb_avail_slots(h) < need) {
                 __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
@@ -392,6 +461,7 @@ intersect(self, other)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::RoaringBitmap::Shared->intersect: bitmap is frozen (read-only)");
     if (!sv_isobject(other) || !sv_derived_from(other, "Data::RoaringBitmap::Shared"))
         croak("Data::RoaringBitmap::Shared->intersect: expected a Data::RoaringBitmap::Shared object");
     {
@@ -408,8 +478,20 @@ intersect(self, other)
             __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
             SvREFCNT_inc(self);
             RETVAL = self;
+        } else if (o->readonly) {
+            /* Frozen other: immutable containers, read lock-free -- take ONLY the
+             * receiver's write lock (o is PROT_READ; an rdlock on it would
+             * SIGSEGV).  intersect never needs new slots. */
+            rb_rwlock_wrlock(h);
+            if (h->hdr->sealed) { rb_rwlock_wrunlock(h); croak("Data::RoaringBitmap::Shared->intersect: bitmap is frozen (read-only)"); }
+            rb_intersect_locked(h, o);
+            __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
+            rb_rwlock_wrunlock(h);
+            SvREFCNT_inc(self);
+            RETVAL = self;
         } else {
             rb_lock_pair(h, o);             /* intersect never needs new slots */
+            if (h->hdr->sealed) { rb_unlock_pair(h, o); croak("Data::RoaringBitmap::Shared->intersect: bitmap is frozen (read-only)"); }
             rb_intersect_locked(h, o);
             __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
             rb_unlock_pair(h, o);
@@ -426,10 +508,42 @@ clear(self)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::RoaringBitmap::Shared->clear: bitmap is frozen (read-only)");
     rb_rwlock_wrlock(h);
+    if (h->hdr->sealed) { rb_rwlock_wrunlock(h); croak("Data::RoaringBitmap::Shared->clear: bitmap is frozen (read-only)"); }
     rb_clear_locked(h);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     rb_rwlock_wrunlock(h);
+
+void
+freeze(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    if (h->readonly) croak("Data::RoaringBitmap::Shared->freeze: cannot freeze a read-only handle");
+    if (rb_freeze(h) != 0) croak("Data::RoaringBitmap::Shared->freeze: msync: %s", strerror(errno));
+    h->readonly = 1;   /* this handle now rejects mutation too (the file is sealed) */
+
+UV
+frozen(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->hdr->sealed ? 1 : 0;
+  OUTPUT:
+    RETVAL
+
+UV
+readonly(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->readonly ? 1 : 0;
+  OUTPUT:
+    RETVAL
 
 SV *
 stats(self)
@@ -442,13 +556,13 @@ stats(self)
         uint32_t cont_used, cont_cap, bkts_used;
         /* Snapshot under the lock; do all (croak-capable) Perl allocation after
            releasing it -- so an OOM in newHV/newSV* can never strand the lock. */
-        rb_rwlock_rdlock(h);
+        if (!h->readonly) rb_rwlock_rdlock(h);   /* frozen: immutable, no lock */
         card      = h->hdr->cardinality;
         cont_used = h->hdr->container_used;
         cont_cap  = h->hdr->container_cap;
         ops       = h->hdr->stat_ops;
         bkts_used = rb_buckets_used(h);
-        rb_rwlock_rdunlock(h);
+        if (!h->readonly) rb_rwlock_rdunlock(h);
 
         HV *hv = newHV();
         hv_stores(hv, "cardinality",         newSVuv((UV)card));
@@ -457,6 +571,8 @@ stats(self)
         hv_stores(hv, "buckets_used",        newSVuv((UV)bkts_used));
         hv_stores(hv, "ops",                 newSVuv((UV)ops));
         hv_stores(hv, "mmap_size",           newSVuv((UV)h->mmap_size));
+        hv_stores(hv, "frozen",              newSVuv(h->hdr->sealed ? 1 : 0));
+        hv_stores(hv, "readonly",            newSVuv(h->readonly ? 1 : 0));
         RETVAL = newRV_noinc((SV *)hv);
     }
   OUTPUT:
@@ -488,7 +604,7 @@ sync(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    if (rb_msync(h) != 0) croak("sync: %s", strerror(errno));
+    if (!h->readonly && rb_msync(h) != 0) croak("sync: %s", strerror(errno));
 
 void
 unlink(self, ...)
