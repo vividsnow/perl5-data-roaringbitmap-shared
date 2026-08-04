@@ -75,7 +75,7 @@ new(class, path = &PL_sv_undef, container_capacity = 256, file_mode = 0600)
   CODE:
     const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     RbHandle *h = rb_create(p, (uint64_t)container_capacity, (mode_t)file_mode, errbuf);   /* validates args into errbuf */
-    if (!h) croak("Data::RoaringBitmap::Shared->new: %s", errbuf);
+    if (!h) croak("Data::RoaringBitmap::Shared->new: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -90,7 +90,7 @@ new_memfd(class, name = &PL_sv_undef, container_capacity = 256)
   CODE:
     const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;   /* undef -> default label */
     RbHandle *h = rb_create_memfd(nm, (uint64_t)container_capacity, errbuf);   /* validates args into errbuf */
-    if (!h) croak("Data::RoaringBitmap::Shared->new_memfd: %s", errbuf);
+    if (!h) croak("Data::RoaringBitmap::Shared->new_memfd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -103,7 +103,7 @@ new_from_fd(class, fd)
     char errbuf[RB_ERR_BUFLEN];
   CODE:
     RbHandle *h = rb_open_fd(fd, errbuf);
-    if (!h) croak("Data::RoaringBitmap::Shared->new_from_fd: %s", errbuf);
+    if (!h) croak("Data::RoaringBitmap::Shared->new_from_fd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
