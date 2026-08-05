@@ -1226,7 +1226,6 @@ static RbHandle *rb_create(const char *path, uint64_t container_cap_in, mode_t f
                         RB_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                     }
-                    memset(base, 0, map_size);   /* start from a provably empty bitmap */
                     rb_init_header(base, container_cap, total);
                     flock(fd, LOCK_UN); close(fd);
                     return rb_setup(base, map_size, path, -1);
