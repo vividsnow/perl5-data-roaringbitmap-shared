@@ -1,7 +1,7 @@
 package Data::RoaringBitmap::Shared;
 use strict;
 use warnings;
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 require XSLoader;
 XSLoader::load('Data::RoaringBitmap::Shared', $VERSION);
 
@@ -22,7 +22,8 @@ __END__
 
 =head1 NAME
 
-Data::RoaringBitmap::Shared - shared-memory Roaring bitmap (compressed uint32 set) for Linux
+Data::RoaringBitmap::Shared - shared-memory Roaring bitmap (compressed uint32
+set) for Linux
 
 =head1 SYNOPSIS
 
@@ -119,13 +120,15 @@ capacity is out of range. A freshly created bitmap is empty
 (C<cardinality == 0>).
 
 When reopening an existing file or memfd, the B<stored geometry wins> and the
-existing elements are preserved; the capacity you pass to C<new> on a reopen is
-used only when the file is brand new. An optional third argument to C<new>,
+existing elements are preserved; the capacity you pass to C<new> on a reopen
+is used only when the file is brand new. An optional third argument to C<new>,
 C<$file_mode> (default C<0600>, owner-only), sets the permission bits of a
-newly created backing file; see L</SECURITY>. C<new_memfd> creates a Linux memfd
-(transferable via its C<memfd> descriptor); C<new_from_fd> reopens one in
-another process. C<new_readonly> opens a B<frozen> file read-only for lock-free
-querying (see L</"FROZEN (READ-ONLY) MODE">).
+newly created backing file; see L</SECURITY>. C<new_memfd> creates a Linux
+memfd (transferable via its C<memfd> descriptor); C<new_from_fd> reopens one
+in another process. The descriptor you pass is duplicated
+(C<F_DUPFD_CLOEXEC>), so it stays yours to close and closing it does not
+disturb the handle. C<new_readonly> opens a B<frozen> file read-only for
+lock-free querying (see L</"FROZEN (READ-ONLY) MODE">).
 
 =head2 Adding and removing
 
@@ -314,11 +317,12 @@ assumes a static copy. Linux-only; 64-bit Perl.
 =head1 SECURITY
 
 Backing files are created mode C<0600> (owner-only) by default; opt in to
-cross-user sharing by passing a wider file mode as the last argument to C<new>. Reads and writes
-bound-check the file-stored container offsets and counts, so reopening a crafted
-or corrupted backing file cannot drive an out-of-bounds access. A process
-granted write access to a shared mapping is still trusted not to corrupt the
-structure while other processes are actively using it.
+cross-user sharing by passing a wider file mode as the last argument to
+C<new>. Reads and writes bound-check the file-stored container offsets and
+counts, so reopening a crafted or corrupted backing file cannot drive an
+out-of-bounds access. A process granted write access to a shared mapping is
+still trusted not to corrupt the structure while other processes are actively
+using it.
 
 =head1 CRASH SAFETY
 
@@ -340,6 +344,16 @@ reclaim it and writers may block until the mapping is recreated. Reaching this
 needs more than 1024 concurrent reader processes on one mapping plus a crash in
 the brief read-lock window; the dead-process slot reclaim keeps the table from
 filling with stale entries, so in practice it is very unlikely.
+
+An interrupted create is recovered too. A creator killed after the backing
+file is sized but before its header is committed leaves a full-size, all-zero
+file. C<new> re-initializes such a file automatically, but only when it is
+exactly the size the requested geometry needs, is owned by your effective uid,
+and is still entirely zero -- a file holding data is never re-initialized. If
+the creator got as far as writing part of the header, the file cannot be told
+apart from a corrupt one and C<new> croaks with C<incomplete roaring-bitmap
+file left by an interrupted create; remove it and retry>. Such a file never
+held any data, so removing it is safe.
 
 =head1 SEE ALSO
 
